@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · LXC Manager</title>
+  <link rel="stylesheet" href="/static/style.css?v=terminal-workspace-3">
+  <style>
+    body { min-height: 100dvh; display: grid; place-items: center; }
+    .login-card { width: min(420px, calc(100% - 32px)); padding: 32px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 70px #0005; }
+    .login-card .brand { display: inline-flex; margin-bottom: 26px; }
+    .login-card label { display: block; margin: 18px 0 8px; font-size: 12px; font-weight: 550; }
+    .login-card input { width: 100%; background: var(--bg); }
+    .login-card button { width: 100%; margin-top: 22px; }
+    .login-error { min-height: 24px; margin-top: 14px; color: var(--danger); }
+  </style>
+</head>
+<body>
+  <main class="login-card">
+    <a class="brand" href="/"><img src="/static/lxc-mark.svg" width="36" height="36" alt=""><span>LXC Manager</span></a>
+    <p class="eyebrow">LINUX ACCOUNT</p>
+    <h1>Sign in</h1>
+    <p class="muted">Use a valid Linux username and password from this host.</p>
+    <form id="login-form">
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" required autofocus>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <p id="login-error" class="login-error" role="alert"></p>
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+  </main>
+  <script>
+    const form = document.getElementById('login-form');
+    const error = document.getElementById('login-error');
+    const params = new URLSearchParams(location.search);
+    const requestedNext = params.get('next') || '/';
+    const next = requestedNext.startsWith('/') && !requestedNext.startsWith('//') ? requestedNext : '/';
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = form.querySelector('button');
+      button.disabled = true; error.textContent = '';
+      try {
+        const response = await fetch('/auth/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, credentials: 'same-origin', body: JSON.stringify(Object.fromEntries(new FormData(form)))});
+        if (!response.ok) { const body = await response.json(); throw new Error(body.detail || 'Unable to sign in.'); }
+        location.replace(next);
+      } catch (loginError) { error.textContent = loginError.message; button.disabled = false; }
+    });
+  </script>
+</body>
+</html>

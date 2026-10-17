@@ -1,0 +1,5 @@
+# LXC Manager PAM service for Debian-family hosts.
+# Review this file and install it as /etc/pam.d/lxc-manager.
+@include common-auth
+@include common-account
+@include common-session

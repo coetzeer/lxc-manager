@@ -1,0 +1,8 @@
+# LXC Manager PAM service for Red Hat-family hosts.
+# Review this file and install it as /etc/pam.d/lxc-manager.
+auth       substack     system-auth
+auth       include      postlogin
+account    include      system-auth
+password   substack     system-auth
+session    include      system-auth
+session    include      postlogin

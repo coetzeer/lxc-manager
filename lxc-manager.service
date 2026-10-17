@@ -1,0 +1,26 @@
+[Unit]
+Description=LXC Manager API
+After=network.target lxc-net.service
+Requires=lxc-net.service
+
+[Service]
+Type=simple
+User=raymondcoetzee
+Group=raymondcoetzee
+WorkingDirectory=/home/raymondcoetzee/.kiro/crew/workspace/lxc-manager
+Environment=PATH=/usr/bin:/usr/local/bin
+ExecStart=/home/raymondcoetzee/.kiro/crew/workspace/lxc-manager/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/raymondcoetzee/.local/share/lxc /home/raymondcoetzee/.config/lxc
+
+[Install]
+WantedBy=multi-user.target

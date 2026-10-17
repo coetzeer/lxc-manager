@@ -18,7 +18,7 @@ FastAPI application with a browser dashboard and REST API for rootless LXC conta
 - **Console output** (last 100 lines)
 - **Async operations** throughout
 - **No persistence layer** - queries LXC directly
-- **Zero auth** - designed for trusted/local networks
+- **Linux-account authentication** - login delegates username/password verification to PAM
 - **OpenAPI/Swagger** docs at `/docs`
 
 ## Requirements
@@ -45,10 +45,15 @@ make dev
 make start PORT=8081
 ```
 
-`make start` prints a new **local access code** unless `LXC_MANAGER_TOKEN` is
-provided. Keep it private: it unlocks browser shell sessions and proxied web
-applications for eight hours in that browser. These features only accept loopback
-connections; do not bind the app to a network interface for interactive use.
+Run `make install`; it installs the runtime dependencies and selects the
+reviewed PAM service template for Debian-family, Red Hat-family, or Arch-family
+systems. Installation of `/etc/pam.d/lxc-manager` uses `sudo` when needed and
+fails clearly on unsupported distributions. Then run `make start`. The app
+serves on loopback by default, and all dashboard/API routes other than health
+and the login endpoints require a valid Linux account. Interactive shell and
+container web-app routes additionally enforce loopback requests. See
+[`docs/auth-design.md`](docs/auth-design.md) for the session, CSRF,
+authorization, and deployment details.
 
 Open [the dashboard](http://127.0.0.1:8080/) to select an image, create a container,
 start/stop/restart/delete containers, inspect logs, and create/delete snapshots.
@@ -61,7 +66,9 @@ LXC's storage backend and container state.
 The frontend uses HTML, CSS, vanilla JavaScript, and locally vendored xterm.js
 served by FastAPI; no Node.js or frontend build is needed. API docs remain at
 `/docs`. Run as the user with the
-rootless LXC setup. The Makefile defaults to loopback because this app has no auth.
+rootless LXC setup. The Makefile defaults to loopback because the current release
+is intended for local-only access; authentication delegates to the host's Linux
+accounts through PAM.
 Distribution choices are configured. The release dropdown loads the live LXC
 system image catalog when the distribution or architecture changes, filtering
 for that distribution, architecture, and the default image variant. Catalog
@@ -72,6 +79,10 @@ errors offer a retry button; creation stays disabled until a release is selected
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/` | Browser dashboard |
+| GET | `/login` | Linux account login page |
+| POST | `/auth/login` | Authenticate through the configured PAM service |
+| GET | `/auth/status` | Current session status |
+| POST | `/auth/logout` | Revoke the current session |
 | GET | `/health` | Health check |
 | GET | `/doctor` | Read-only rootless setup and traversal checks |
 | GET | `/doctor?name=agent-hermes` | Check container mappings and rootfs parent permissions |
@@ -177,8 +188,8 @@ these DOM-adapter tests.
 
 ### Shells and container web apps
 
-Use **Open shell** from a running container's row, unlock it with the local
-access code, choose an executable shell, and work in the persistent bottom-docked
+Sign in with a valid Linux account, then use **Open shell** from a running
+container's row, choose an executable shell, and work in the persistent bottom-docked
 xterm.js terminal workspace. Each click creates a separate session; dock tabs
 switch between sessions without closing them. Keystrokes, ANSI colors, cursor addressing, terminal resizing,
 Ctrl+C, and full-screen programs are sent through a WebSocket to a shell launched
@@ -186,11 +197,13 @@ inside its own PTY with `TERM=xterm-256color`. Ctrl+Shift+C/V copies and pastes.
 Minimizing the dock leaves sessions alive, browser refresh reconnects persisted
 tabs when possible, and disconnected shells remain available for 60 seconds.
 Shell paths must be absolute executable paths inside the container; arbitrary
-shell arguments are not accepted.
+shell arguments are not accepted. Shell discovery prefers Bash, zsh, or fish
+over `/bin/sh` because those interactive shells provide tab completion; `/bin/sh`
+remains the fallback for minimal images.
 
 Use **Open web app** and enter the port used by an HTTP service in the running
 container. The manager discovers the container's private IPv4 address and
-reverse-proxies the app through an authenticated local route. Relative paths,
+reverse-proxies the app through a local-only route. Relative paths,
 HTTP redirects, and cookie paths are rewritten for this route. Apps that hardcode
 an absolute hostname, use external WebSocket origins, or require HTTPS may need
 their own reverse-proxy configuration. Only private container addresses are
