@@ -620,12 +620,12 @@ async def authentication_middleware(request: Request, call_next):
 
 @app.get("/", include_in_schema=False)
 async def dashboard():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/login", include_in_schema=False)
 async def login_page():
-    return FileResponse(STATIC_DIR / "login.html")
+    return FileResponse(STATIC_DIR / "login.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/auth/status")
@@ -1253,4 +1253,4 @@ async def get_console(name: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    uvicorn.run(app, host="127.0.0.1", port=8083)
