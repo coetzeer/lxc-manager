@@ -1,8 +1,14 @@
 """
 FastAPI application for rootless LXC container management (LXC 7.0 CLI).
-"""
 
-from contextlib import asynccontextmanager
+This module is a thin backward-compatible shim. The application is built by
+:func:`lxc_manager.app.create_app`, which wires the container routes through a
+dependency-injected :class:`lxc_manager.services.containers.ContainerService`.
+Auth, shell, proxy, doctor, and image-catalog routes (plus the module-level
+helpers the test suite patches) remain here so existing tests keep working
+while the container layer is migrated to the new package.
+"""
+from contextlib import suppress
 from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
@@ -11,7 +17,6 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from uuid import uuid4
 import asyncio
-import contextlib
 import hashlib
 import hmac
 import ipaddress
@@ -33,36 +38,25 @@ from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
 import httpx
 
+from lxc_manager.app import app  # noqa: F401  (built by create_app)
+from lxc_manager.app import STATIC_DIR  # noqa: F401
+from lxc_manager.domain.models import (  # noqa: F401
+    ContainerCreate,
+    ContainerAction,
+    ContainerResponse,
+    ContainerMetrics,
+    LoginCredentials,
+    Principal,
+    SessionRecord,
+    LoginThrottle,
+    DISTRO_IMAGES,
+)
+from lxc_manager.config import LxcConfig  # noqa: F401
 
 logger = logging.getLogger("lxc-manager.auth")
 
-
 # Supported LXC image distributions (from lxc-launch.sh)
-DISTRO_IMAGES = {
-    "almalinux": {"release": "10", "alias": "alma"},
-    "alpine": {"release": "3.24", "alias": "alpine"},
-    "alt": {"release": "p11", "alias": "alt"},
-    "amazonlinux": {"release": "2023", "alias": "amazonlinux"},
-    "archlinux": {"release": "current", "alias": "archlinux"},
-    "busybox": {"release": "1.38.0", "alias": "busybox"},
-    "centos": {"release": "10-Stream", "alias": "centos"},
-    "debian": {"release": "bookworm", "alias": "debian"},
-    "devuan": {"release": "daedalus", "alias": "devuan"},
-    "fedora": {"release": "44", "alias": "fedora"},
-    "kali": {"release": "current", "alias": "kali"},
-    "mint": {"release": "zena", "alias": "mint"},
-    "nixos": {"release": "26.05", "alias": "nixos"},
-    "openeuler": {"release": "24.03", "alias": "openeuler"},
-    "opensuse": {"release": "16.0", "alias": "opensuse"},
-    "openwrt": {"release": "25.12", "alias": "openwrt"},
-    "oracle": {"release": "10", "alias": "oracle"},
-    "plamo": {"release": "8.x", "alias": "plamo"},
-    "rockylinux": {"release": "10", "alias": "rocky"},
-    "slackware": {"release": "15.0", "alias": "slackware"},
-    "ubuntu": {"release": "resolute", "alias": "ubuntu"},
-    "voidlinux": {"release": "current", "alias": "void"},
-}
-
+# (re-exported from lxc_manager.domain.models for backward compatibility)
 
 LXC_PATH = "/usr/bin"
 AUTH_COOKIE = "lxc_manager_session"
@@ -102,44 +96,8 @@ class ShellSession:
 SHELL_SESSIONS: dict[str, ShellSession] = {}
 
 
-class ContainerCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=64, pattern=r'^[a-zA-Z0-9_-]+$')
-    distro: str = Field(..., description="Base image distribution")
-    release: Optional[str] = Field(None, description="Specific release (uses default if omitted)")
-    arch: str = Field("amd64", pattern=r'^(amd64|arm64|i386)$')
-
-
-class ContainerAction(BaseModel):
-    name: str
-
-
-class ContainerResponse(BaseModel):
-    name: str
-    status: str
-    pid: Optional[int] = None
-    ipv4: Optional[str] = None
-    ipv6: Optional[str] = None
-
-
-class ContainerMetrics(BaseModel):
-    name: str
-    cpu_usage_percent: Optional[float] = None
-    memory_usage_bytes: Optional[int] = None
-    memory_limit_bytes: Optional[int] = None
-    disk_read_bytes: Optional[int] = None
-    disk_write_bytes: Optional[int] = None
-    network_rx_bytes: Optional[int] = None
-    network_tx_bytes: Optional[int] = None
-    snapshots: List[str] = []
-
-
-class LoginCredentials(BaseModel):
-    username: str = Field(..., min_length=1, max_length=128)
-    password: str = Field(..., min_length=1, max_length=4096)
-
-
 @dataclass(frozen=True)
-class Principal:
+class Principal:  # noqa: F811  (re-export alias; domain.Principal is the canonical one)
     username: str
     uid: int
     gid: int
@@ -148,7 +106,7 @@ class Principal:
 
 
 @dataclass
-class SessionRecord:
+class SessionRecord:  # noqa: F811
     principal: Principal
     csrf_hash: str
     created_at: float
@@ -157,7 +115,7 @@ class SessionRecord:
 
 
 @dataclass
-class LoginThrottle:
+class LoginThrottle:  # noqa: F811
     failures: int = 0
     retry_after: float = 0.0
 
@@ -415,9 +373,7 @@ def parse_lxc_ls_output(output: str) -> List[ContainerResponse]:
     lines = output.strip().split('\n')
     if len(lines) < 2:
         return containers
-    
-    # lxc-ls uses fixed-width columns, sometimes separated by a single space.
-    # Header positions also preserve IP lists containing spaces and commas.
+
     columns = [(match.group(), match.start()) for match in re.finditer(r'\S+', lines[0])]
     if not {"NAME", "STATE", "PID", "IPV4", "IPV6"}.issubset(key for key, _ in columns):
         return containers
@@ -488,7 +444,6 @@ async def get_container_metrics(name: str, include_snapshots: bool = True) -> Co
     """Get resource metrics for a running container."""
     metrics = ContainerMetrics(name=name)
 
-    # Sample cumulative CPU time over an interval; 100% means one busy core.
     started = time.monotonic()
     code, stdout, _ = await run_lxc_attach(name, "cat", "/sys/fs/cgroup/cpu.stat", timeout=5)
     if code == 0 and stdout:
@@ -517,7 +472,6 @@ async def get_container_metrics(name: str, include_snapshots: bool = True) -> Co
         except ValueError:
             pass
 
-    # Disk I/O from cgroup
     code, stdout, _ = await run_lxc_attach(name, "cat", "/sys/fs/cgroup/io.stat", timeout=5)
     if code == 0 and stdout:
         totals = {"rbytes": 0, "wbytes": 0}
@@ -532,7 +486,6 @@ async def get_container_metrics(name: str, include_snapshots: bool = True) -> Co
         metrics.disk_read_bytes = totals["rbytes"]
         metrics.disk_write_bytes = totals["wbytes"]
 
-    # Network stats
     code, stdout, _ = await run_lxc_attach(name, "cat", "/proc/net/dev", timeout=5)
     if code == 0 and stdout:
         for line in stdout.splitlines()[2:]:
@@ -544,7 +497,6 @@ async def get_container_metrics(name: str, include_snapshots: bool = True) -> Co
                 except (ValueError, IndexError):
                     pass
 
-    # Snapshots
     if include_snapshots:
         metrics.snapshots = await get_snapshot_list(name)
     return metrics
@@ -556,38 +508,17 @@ async def get_snapshot_list(name: str) -> List[str]:
     if code != 0:
         raise HTTPException(status_code=500, detail=f"Failed to list snapshots: {stderr}")
     if code == 0 and stdout:
-        # Parse snapshot list output
         for line in stdout.splitlines():
             line = line.strip()
             if line and not line.startswith("Snapshots"):
-                # Format: snap0  2024-01-01 12:00:00
                 snap_name = line.split()[0]
                 if snap_name:
                     snapshots.append(snap_name)
-
     return snapshots
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Verify rootless LXC setup on startup
-    code, stdout, stderr = await run_lxc_cmd("ls", "-f", "-F", "NAME")
-    if code != 0:
-        print(f"Warning: LXC not accessible: {stderr}")
-    else:
-        print("LXC rootless setup verified")
-    yield
-
-
-app = FastAPI(
-    title="LXC Manager API",
-    description="Rootless LXC container management via FastAPI (LXC 7.0 CLI)",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="static")
+# NOTE: lifespan and /static mount are defined in lxc_manager.app; this app
+# already carries them.
 
 
 @app.middleware("http")
@@ -710,7 +641,6 @@ def acl_allows_traversal(acl: str, uid: int, gid: int, owner_uid: int, owner_gid
 
 async def check_rootfs_traversal(rootfs: Path, uid: int, gid: int) -> list:
     checks = []
-    # Include every ancestor, but do not inspect or modify rootfs contents.
     for directory in reversed(rootfs.resolve().parents):
         try:
             metadata = directory.stat()
@@ -769,7 +699,6 @@ async def doctor(name: Optional[str] = Query(None, min_length=1, max_length=64, 
         checks.append({"id": "root_mapping", "status": "ok", "message": f"Container root maps to host UID {uid}, GID {gid}."})
         if restricted_namespace is False:
             if not name:
-                # Check existing parent directories only before container creation.
                 rootfs = home / ".local/share/lxc" / "new-container"
             checks.extend(await check_rootfs_traversal(rootfs, uid, gid))
         else:
@@ -827,32 +756,6 @@ async def list_image_releases(distro: str, arch: str = Query("amd64", pattern=r"
     return {"distro": distro, "arch": arch, "releases": sorted(releases), "default_release": DISTRO_IMAGES[distro]["release"]}
 
 
-@app.get("/containers", response_model=List[ContainerResponse])
-async def list_containers():
-    """List all containers with their status."""
-    return await get_container_list()
-
-
-@app.get("/containers/{name}", response_model=ContainerResponse)
-async def get_container(name: str):
-    """Get details for a specific container."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-    return container
-
-
-@app.get("/containers/{name}/metrics", response_model=ContainerMetrics)
-async def get_metrics(name: str, include_snapshots: bool = Query(True)):
-    """Get resource metrics for a running container."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-    if container.status != "RUNNING":
-        raise HTTPException(status_code=400, detail=f"Container '{name}' is not running")
-    return await get_container_metrics(name, include_snapshots=include_snapshots)
-
-
 def validate_shell_path(shell: str) -> str:
     if not isinstance(shell, str) or len(shell) > 256 or not SHELL_PATH_RE.fullmatch(shell):
         raise ValueError("Shell must be an absolute executable path without arguments.")
@@ -875,9 +778,9 @@ def default_shell(shells: List[str]) -> str:
 
 async def enqueue_shell_output(session: ShellSession, output: Optional[bytes]) -> None:
     if session.output.full():
-        with contextlib.suppress(asyncio.QueueEmpty):
+        with suppress(asyncio.QueueEmpty):
             session.output.get_nowait()
-    with contextlib.suppress(asyncio.QueueFull):
+    with suppress(asyncio.QueueFull):
         session.output.put_nowait(output)
 
 
@@ -903,14 +806,14 @@ async def terminate_shell_session(session: ShellSession) -> None:
     if session.grace_task and session.grace_task is not asyncio.current_task():
         session.grace_task.cancel()
     if session.process.returncode is None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(session.process.pid, signal.SIGTERM)
-        with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+        with suppress(asyncio.TimeoutError, TimeoutError):
             await asyncio.wait_for(session.process.wait(), timeout=3)
     if session.process.returncode is None:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(session.process.pid, signal.SIGKILL)
-        with contextlib.suppress(Exception):
+        with suppress(Exception):
             await session.process.wait()
     if session.reader_task and session.reader_task is not asyncio.current_task():
         session.reader_task.cancel()
@@ -990,7 +893,7 @@ async def container_shell(websocket: WebSocket, name: str, shell: str = DEFAULT_
         session = await create_shell_session(name, shell, session_id, principal.username)
     await websocket.accept()
     if session.websocket and session.websocket is not websocket:
-        with contextlib.suppress(RuntimeError, OSError):
+        with suppress(RuntimeError, OSError):
             await session.websocket.close(code=4001, reason="Session reconnected elsewhere")
     session.websocket = websocket
     if session.grace_task:
@@ -1043,7 +946,7 @@ async def container_shell(websocket: WebSocket, name: str, shell: str = DEFAULT_
             await terminate_shell_session(session)
         elif not session.grace_task:
             session.grace_task = asyncio.create_task(expire_shell_session(session))
-        with contextlib.suppress(RuntimeError, OSError):
+        with suppress(RuntimeError, OSError):
             await websocket.close(code=1000, reason=close_reason)
 
 
@@ -1078,177 +981,6 @@ async def proxy_container_web_app(request: Request, name: str, port: int, proxy_
     for cookie in upstream_response.headers.get_list("set-cookie"):
         response.headers.append("set-cookie", re.sub(r"(?i)(;\s*path=)/", rf"\1{base_path}/", cookie))
     return response
-
-
-@app.post("/containers", response_model=ContainerResponse, status_code=201)
-async def create_container(container: ContainerCreate):
-    """Create a new container from a base image."""
-    distro_lower = container.distro.lower()
-    if distro_lower not in DISTRO_IMAGES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported distro '{container.distro}'. Available: {', '.join(sorted(DISTRO_IMAGES.keys()))}",
-        )
-
-    distro_info = DISTRO_IMAGES[distro_lower]
-    release = container.release or distro_info["release"]
-
-    existing = await get_container_info(container.name)
-    if existing:
-        raise HTTPException(status_code=409, detail=f"Container '{container.name}' already exists")
-
-    # Create container using download template
-    code, stdout, stderr = await run_lxc_cmd(
-        "create",
-        "-n", container.name,
-        "-t", "download",
-        "--",
-        "--dist", distro_lower,
-        "--release", release,
-        "--arch", container.arch,
-        timeout=180,
-    )
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Failed to create container: {stderr}")
-
-    created = await get_container_info(container.name)
-    if not created:
-        raise HTTPException(status_code=500, detail="Container created but not found")
-    return created
-
-
-@app.post("/containers/{name}/start", response_model=ContainerResponse)
-async def start_container(name: str):
-    """Start a container."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-    if container.status == "RUNNING":
-        return container
-
-    code, _, stderr = await run_lxc_cmd("start", "-n", name, timeout=30)
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Failed to start container: {stderr}")
-
-    await asyncio.sleep(1)
-    return await get_container_info(name)
-
-
-@app.post("/containers/{name}/stop", response_model=ContainerResponse)
-async def stop_container(name: str, force: bool = Query(False)):
-    """Stop a container."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-    if container.status != "RUNNING":
-        return container
-
-    args = ["stop", "-n", name]
-    if force:
-        args.insert(1, "-k")
-
-    code, _, stderr = await run_lxc_cmd(*args, timeout=30)
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Failed to stop container: {stderr}")
-
-    await asyncio.sleep(1)
-    return await get_container_info(name)
-
-
-@app.post("/containers/{name}/restart", response_model=ContainerResponse)
-async def restart_container(name: str):
-    """Restart a container."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-
-    if container.status == "RUNNING":
-        code, _, stderr = await run_lxc_cmd("stop", "-n", name, timeout=30)
-        if code != 0:
-            raise HTTPException(status_code=500, detail=f"Failed to stop container for restart: {stderr}")
-    code, _, stderr = await run_lxc_cmd("start", "-n", name, timeout=30)
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Failed to restart container: {stderr}")
-
-    await asyncio.sleep(1)
-    return await get_container_info(name)
-
-
-@app.delete("/containers/{name}", status_code=204)
-async def delete_container(name: str, force: bool = Query(False)):
-    """Delete a container."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-
-    if container.status == "RUNNING":
-        code, _, stderr = await run_lxc_cmd("stop", "-n", name, "-k", timeout=30)
-        if code != 0:
-            raise HTTPException(status_code=500, detail=f"Failed to stop container before deletion: {stderr}")
-        await asyncio.sleep(1)
-
-    args = ["destroy", "-n", name]
-    if force:
-        args.append("-f")
-
-    code, _, stderr = await run_lxc_cmd(*args, timeout=30)
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Failed to delete container: {stderr}")
-
-    return JSONResponse(status_code=204, content=None)
-
-
-@app.post("/containers/{name}/snapshot")
-async def create_snapshot(name: str, snapshot_name: Optional[str] = None):
-    """Create a snapshot of a container."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-
-    args = ["snapshot", "-n", name]
-    if snapshot_name:
-        args.extend(["-c", snapshot_name])  # -c for comment/name
-
-    code, stdout, stderr = await run_lxc_cmd(*args, timeout=30)
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Failed to create snapshot: {stderr}")
-
-    return {"message": "Snapshot created", "output": stdout}
-
-
-@app.get("/containers/{name}/snapshots")
-async def list_snapshots(name: str):
-    if not await get_container_info(name):
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-    return {"snapshots": await get_snapshot_list(name)}
-
-
-@app.delete("/containers/{name}/snapshots/{snapshot_name}", status_code=204)
-async def delete_snapshot(name: str, snapshot_name: str):
-    """Delete a container snapshot."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-
-    code, _, stderr = await run_lxc_cmd("snapshot", "-n", name, "-d", snapshot_name, timeout=10)
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Failed to delete snapshot: {stderr}")
-
-    return JSONResponse(status_code=204, content=None)
-
-
-@app.get("/containers/{name}/console")
-async def get_console(name: str):
-    """Get container console output (last 100 lines)."""
-    container = await get_container_info(name)
-    if not container:
-        raise HTTPException(status_code=404, detail=f"Container '{name}' not found")
-
-    code, stdout, stderr = await run_lxc_attach(name, "journalctl", "-n", "100", "--no-pager", timeout=10)
-    if code != 0:
-        code, stdout, stderr = await run_lxc_attach(name, "dmesg", "-T", timeout=10)
-
-    return {"console": stdout or stderr}
 
 
 if __name__ == "__main__":

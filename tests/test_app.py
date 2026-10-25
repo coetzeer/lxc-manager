@@ -1,4 +1,10 @@
-"""Isolated contract tests: never create or delete real containers."""
+"""Isolated contract tests: never create or delete real containers.
+
+Container lifecycle tests now inject a fake :class:`lxc_manager.services.lxc.LxcClient`
+through FastAPI dependency injection instead of patching ``main.run_lxc_cmd``.
+Auth, shell, proxy, doctor, and image tests continue to exercise the
+``main.py`` shim functions directly.
+"""
 import unittest
 import json
 import os
@@ -11,10 +17,59 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import main
 
+from lxc_manager.api.deps import get_container_service
+from lxc_manager.config import LxcConfig
+from lxc_manager.services.containers import ContainerService
+from lxc_manager.services.lxc import LxcResult
+
+
+class FakeLxcClient:
+    """In-memory LxcClient that records calls and returns queued results.
+
+    Use :meth:`queue_result` to pre-program the result returned for a
+    particular ``(method, *args)`` call. Results are consumed in FIFO order;
+    once a queue is exhausted a default successful empty result is returned.
+    """
+
+    def __init__(self):
+        self.calls = []  # list of (method, args_tuple, kwargs_dict)
+        self._queue = {}  # (method, args) -> [LxcResult, ...]
+
+    def queue_result(self, method, *args, result):
+        key = (method, args)
+        self._queue.setdefault(key, []).append(result)
+
+    async def run(self, *args, timeout=30):
+        self.calls.append(("run", args, {"timeout": timeout}))
+        return LxcResult(0, "", "")
+
+    async def run_lxc(self, subcommand, *args, timeout=30):
+        self.calls.append(("run_lxc", (subcommand,) + args, {"timeout": timeout}))
+        key = ("run_lxc", (subcommand,) + args)
+        results = self._queue.get(key, [])
+        if results:
+            return results.pop(0)
+        return LxcResult(0, "", "")
+
+    async def run_attach(self, name, *args, timeout=30):
+        self.calls.append(("run_attach", (name,) + args, {"timeout": timeout}))
+        key = ("run_attach", (name,) + args)
+        results = self._queue.get(key, [])
+        if results:
+            return results.pop(0)
+        return LxcResult(0, "", "")
+
+
+def _ls_output(name: str, status: str, pid: str = "-") -> str:
+    return f"NAME STATE   PID IPV4     IPV6\n{name} {status}  {pid}  -    -    "
+
 
 class AppTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app, client=("127.0.0.1", 50000)), base_url="http://test")
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=main.app, client=("127.0.0.1", 50000)),
+            base_url="http://test",
+        )
         class FakeAuthenticator:
             def authenticate(self, username, password):
                 if username == "raymond" and password == "correct-password":
@@ -26,13 +81,22 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         main.LOGIN_THROTTLES.clear()
         response = await self.client.post("/auth/login", json={"username": "raymond", "password": "correct-password"})
         self.assertEqual(response.status_code, 204)
+        self.config = LxcConfig()
 
     async def asyncTearDown(self):
         await self.client.aclose()
         self.authenticator_patch.stop()
+        main.app.dependency_overrides.clear()
+
+    def _install_service(self, fake_lxc: FakeLxcClient) -> ContainerService:
+        service = ContainerService(fake_lxc, self.config)
+        main.app.dependency_overrides[get_container_service] = lambda: service
+        return service
 
     def csrf_headers(self):
         return {"X-CSRF-Token": self.client.cookies.get(main.CSRF_COOKIE)}
+
+    # -- untouched: subprocess behaviour -----------------------------------
 
     async def test_subprocess_has_no_input_or_controlling_terminal(self):
         script = """
@@ -72,6 +136,8 @@ print('captured stderr', file=sys.stderr)
             self.assertEqual(response.status_code, 200)
             self.assertIn(content_type, response.headers["content-type"])
 
+    # -- auth (unchanged) ---------------------------------------------------
+
     async def test_local_interactive_access_requires_no_code(self):
         with patch.object(main, "get_container_info", AsyncMock(return_value=None)):
             response = await self.client.get("/containers/demo/web/8080/")
@@ -101,8 +167,244 @@ print('captured stderr', file=sys.stderr)
             await remote.aclose()
 
     async def test_authenticated_mutations_require_csrf_token(self):
+        # CSRF is rejected by middleware before the container service runs.
         response = await self.client.post("/containers", json={"name": "demo", "distro": "alpine"})
         self.assertEqual(response.status_code, 403)
+
+    # -- container lifecycle (DI via FakeLxcClient) --------------------------
+
+    async def test_list_and_health(self):
+        output = "NAME STATE   PID IPV4     IPV6\ndemo RUNNING 42  10.0.0.2 -"
+        fake_lxc = FakeLxcClient()
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, output, ""),
+        )
+        self._install_service(fake_lxc)
+
+        response = await self.client.get("/containers")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()[0]["name"], "demo")
+
+        # /health still uses main.run_lxc_cmd directly.
+        with patch.object(main, "run_lxc_cmd", AsyncMock(return_value=(0, "", ""))):
+            self.assertTrue((await self.client.get("/health")).json()["lxc_accessible"])
+
+    async def test_create_payload_and_command(self):
+        fake_lxc = FakeLxcClient()
+        # _exists -> get -> list: no containers yet
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, "NAME STATE   PID IPV4     IPV6\n", ""),
+        )
+        # create
+        fake_lxc.queue_result(
+            "run_lxc", "create", "-n", "demo", "-t", "download", "--",
+            "--dist", "alpine", "--release", "3.23", "--arch", "arm64",
+            result=LxcResult(0, "", ""),
+        )
+        # get after create -> list returns demo STOPPED
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, _ls_output("demo", "STOPPED"), ""),
+        )
+        self._install_service(fake_lxc)
+
+        response = await self.client.post(
+            "/containers",
+            json={"name": "demo", "distro": "alpine", "release": "3.23", "arch": "arm64"},
+            headers=self.csrf_headers(),
+        )
+        self.assertEqual(response.status_code, 201)
+
+        create_calls = [
+            c for c in fake_lxc.calls
+            if c[0] == "run_lxc" and c[1][0] == "create"
+        ]
+        self.assertEqual(len(create_calls), 1)
+        self.assertEqual(
+            create_calls[0][1],
+            ("create", "-n", "demo", "-t", "download", "--", "--dist", "alpine", "--release", "3.23", "--arch", "arm64"),
+        )
+        self.assertEqual(create_calls[0][2]["timeout"], 180)
+
+    async def test_real_lxc_spacing_lists_container_and_blocks_duplicate(self):
+        output = "NAME         STATE   PID IPV4 IPV6 \nagent-hermes STOPPED -   -    -    "
+        fake_lxc = FakeLxcClient()
+        # GET /containers -> list
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, output, ""),
+        )
+        # POST /containers -> _exists -> get -> list (duplicate found)
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, output, ""),
+        )
+        self._install_service(fake_lxc)
+
+        response = await self.client.get("/containers")
+        self.assertEqual(
+            response.json(),
+            [{"name": "agent-hermes", "status": "STOPPED", "pid": None, "ipv4": None, "ipv6": None}],
+        )
+
+        response = await self.client.post(
+            "/containers", json={"name": "agent-hermes", "distro": "alpine"}, headers=self.csrf_headers()
+        )
+        self.assertEqual(response.status_code, 409)
+
+        lxc_calls = [c for c in fake_lxc.calls if c[0] == "run_lxc"]
+        self.assertTrue(all(call[1][0] == "ls" for call in lxc_calls))
+
+    async def test_invalid_name_and_duplicate(self):
+        # 422 for invalid name: FastAPI validation happens before the service.
+        response = await self.client.post(
+            "/containers", json={"name": "../bad", "distro": "alpine"}, headers=self.csrf_headers()
+        )
+        self.assertEqual(response.status_code, 422)
+
+        # 409 for duplicate: service returns AlreadyExists.
+        fake_lxc = FakeLxcClient()
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, _ls_output("demo", "STOPPED"), ""),
+        )
+        self._install_service(fake_lxc)
+        response = await self.client.post(
+            "/containers", json={"name": "demo", "distro": "alpine"}, headers=self.csrf_headers()
+        )
+        self.assertEqual(response.status_code, 409)
+
+    async def test_dashboard_metrics_skip_snapshot_subprocess(self):
+        fake_lxc = FakeLxcClient()
+        # get -> list returns demo RUNNING (one entry per metrics request)
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, _ls_output("demo", "RUNNING"), ""),
+        )
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, _ls_output("demo", "RUNNING"), ""),
+        )
+        # get_metrics calls run_attach for cgroup files -> empty stdout defaults
+        self._install_service(fake_lxc)
+
+        response = await self.client.get("/containers/demo/metrics?include_snapshots=false")
+        self.assertEqual(response.status_code, 200)
+        snapshot_calls = [
+            c for c in fake_lxc.calls
+            if c[0] == "run_lxc" and c[1][0] == "snapshot"
+        ]
+        self.assertEqual(len(snapshot_calls), 0)
+
+        response = await self.client.get("/containers/demo/metrics")
+        self.assertEqual(response.status_code, 200)
+        snapshot_calls = [
+            c for c in fake_lxc.calls
+            if c[0] == "run_lxc" and c[1][0] == "snapshot" and "-L" in c[1]
+        ]
+        self.assertEqual(len(snapshot_calls), 1)
+
+    async def test_stopped_metrics_and_snapshot_listing(self):
+        fake_lxc = FakeLxcClient()
+        # GET /metrics -> get -> list returns demo STOPPED
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, _ls_output("demo", "STOPPED"), ""),
+        )
+        # GET /snapshots -> get -> list returns demo STOPPED (second queue entry)
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, _ls_output("demo", "STOPPED"), ""),
+        )
+        fake_lxc.queue_result(
+            "run_lxc", "snapshot", "-n", "demo", "-L",
+            result=LxcResult(0, "snap0 (/path) 2026:10:12 12:00:00\n", ""),
+        )
+        self._install_service(fake_lxc)
+
+        response = await self.client.get("/containers/demo/metrics")
+        self.assertEqual(response.status_code, 400)
+
+        response = await self.client.get("/containers/demo/snapshots")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"snapshots": ["snap0"]})
+
+    async def test_restart_stops_then_starts(self):
+        fake_lxc = FakeLxcClient()
+        # get -> list returns demo RUNNING
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, _ls_output("demo", "RUNNING"), ""),
+        )
+        # stop -> start -> final get -> list returns demo RUNNING
+        fake_lxc.queue_result("run_lxc", "stop", "-n", "demo", result=LxcResult(0, "", ""))
+        fake_lxc.queue_result("run_lxc", "start", "-n", "demo", result=LxcResult(0, "", ""))
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, _ls_output("demo", "RUNNING"), ""),
+        )
+        self._install_service(fake_lxc)
+
+        with patch.object(main.asyncio, "sleep", AsyncMock()):
+            response = await self.client.post("/containers/demo/restart", headers=self.csrf_headers())
+        self.assertEqual(response.status_code, 200)
+
+        lxc_calls = [c for c in fake_lxc.calls if c[0] == "run_lxc"]
+        subcommands = [call[1][0] for call in lxc_calls]
+        self.assertIn("stop", subcommands)
+        self.assertIn("start", subcommands)
+        stop_idx = subcommands.index("stop")
+        start_idx = subcommands.index("start")
+        self.assertLess(stop_idx, start_idx)
+
+    async def test_missing_container_and_command_error(self):
+        fake_lxc = FakeLxcClient()
+        # GET /containers/missing/snapshots -> get -> list empty -> 404
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(0, "NAME STATE   PID IPV4     IPV6\n", ""),
+        )
+        self._install_service(fake_lxc)
+
+        response = await self.client.get("/containers/missing/snapshots")
+        self.assertEqual(response.status_code, 404)
+
+        # GET /containers -> list fails -> 500 ; /health -> main.run_lxc_cmd fails
+        fake_lxc.queue_result(
+            "run_lxc", "ls", "-f", "-F", "NAME,STATE,PID,IPV4,IPV6",
+            result=LxcResult(1, "", "LXC unavailable"),
+        )
+        response = await self.client.get("/containers")
+        self.assertEqual(response.status_code, 500)
+
+        with patch.object(main, "run_lxc_cmd", AsyncMock(return_value=(1, "", "LXC unavailable"))):
+            self.assertFalse((await self.client.get("/health")).json()["lxc_accessible"])
+
+    # -- untouched: direct function calls ------------------------------------
+
+    def test_parser_preserves_multiple_ips_and_empty_listing(self):
+        output = f'{"NAME":<13}{"STATE":<8}{"PID":<6}{"IPV4":<24}IPV6\n'
+        output += f'{"demo":<13}{"RUNNING":<8}{"123":<6}{"10.0.0.2, 10.0.0.3":<24}fd00::2'
+        container = main.parse_lxc_ls_output(output)[0]
+        self.assertEqual(container.ipv4, "10.0.0.2, 10.0.0.3")
+        self.assertEqual(container.ipv6, "fd00::2")
+        self.assertEqual(container.pid, 123)
+        self.assertEqual(main.parse_lxc_ls_output(""), [])
+        self.assertEqual(main.parse_lxc_ls_output("NAME STATE PID IPV4 IPV6"), [])
+
+    async def test_metrics_cpu_delta_and_disk_totals(self):
+        values = [(0, "usage_usec 1000000", ""), (0, "usage_usec 1250000", ""), (0, "1024", ""), (0, "max", ""), (0, "8:0 rbytes=10 wbytes=20 rios=1\n8:1 rbytes=30 wbytes=40", ""), (0, "header\nheader\neth0: 100 0 0 0 0 0 0 0 200 0 0 0 0 0 0 0", "")]
+        with patch.object(main, "run_lxc_attach", AsyncMock(side_effect=values)), patch.object(main, "get_snapshot_list", AsyncMock(return_value=["snap0"])), patch.object(main.time, "monotonic", side_effect=[10.0, 10.5]), patch.object(main.asyncio, "sleep", AsyncMock()):
+            metrics = await main.get_container_metrics("demo")
+        self.assertEqual(metrics.cpu_usage_percent, 50.0)
+        self.assertEqual(metrics.disk_read_bytes, 40)
+        self.assertEqual(metrics.disk_write_bytes, 60)
+        self.assertEqual(metrics.network_tx_bytes, 200)
+        self.assertIsNone(metrics.memory_limit_bytes)
+
+    # -- proxy / images / doctor (unchanged) ---------------------------------
 
     async def test_proxy_requires_no_code_on_localhost(self):
         with patch.object(main, "get_container_info", AsyncMock(return_value=None)):
@@ -246,80 +548,6 @@ print('captured stderr', file=sys.stderr)
             self.assertEqual((await self.client.get("/images/alpine/releases?arch=invalid")).status_code, 422)
             download.assert_not_called()
 
-    async def test_list_and_health(self):
-        output = "NAME STATE   PID IPV4     IPV6\ndemo RUNNING 42  10.0.0.2 -"
-        with patch.object(main, "run_lxc_cmd", AsyncMock(return_value=(0, output, ""))):
-            response = await self.client.get("/containers")
-            self.assertEqual(response.json()[0]["name"], "demo")
-            self.assertTrue((await self.client.get("/health")).json()["lxc_accessible"])
-
-    async def test_create_payload_and_command(self):
-        created = main.ContainerResponse(name="demo", status="STOPPED")
-        with patch.object(main, "get_container_info", AsyncMock(side_effect=[None, created])), patch.object(main, "run_lxc_cmd", AsyncMock(return_value=(0, "", ""))) as command:
-            response = await self.client.post("/containers", json={"name": "demo", "distro": "alpine", "release": "3.23", "arch": "arm64"}, headers=self.csrf_headers())
-            self.assertEqual(response.status_code, 201)
-            command.assert_awaited_once_with("create", "-n", "demo", "-t", "download", "--", "--dist", "alpine", "--release", "3.23", "--arch", "arm64", timeout=180)
-
-    async def test_real_lxc_spacing_lists_container_and_blocks_duplicate(self):
-        output = "NAME         STATE   PID IPV4 IPV6 \nagent-hermes STOPPED -   -    -    "
-        with patch.object(main, "run_lxc_cmd", AsyncMock(return_value=(0, output, ""))) as command:
-            response = await self.client.get("/containers")
-            self.assertEqual(response.json(), [{"name": "agent-hermes", "status": "STOPPED", "pid": None, "ipv4": None, "ipv6": None}])
-            response = await self.client.post("/containers", json={"name": "agent-hermes", "distro": "alpine"}, headers=self.csrf_headers())
-            self.assertEqual(response.status_code, 409)
-            self.assertTrue(all(call.args[0] == "ls" for call in command.await_args_list))
-
-    def test_parser_preserves_multiple_ips_and_empty_listing(self):
-        output = f'{"NAME":<13}{"STATE":<8}{"PID":<6}{"IPV4":<24}IPV6\n'
-        output += f'{"demo":<13}{"RUNNING":<8}{"123":<6}{"10.0.0.2, 10.0.0.3":<24}fd00::2'
-        container = main.parse_lxc_ls_output(output)[0]
-        self.assertEqual(container.ipv4, "10.0.0.2, 10.0.0.3")
-        self.assertEqual(container.ipv6, "fd00::2")
-        self.assertEqual(container.pid, 123)
-        self.assertEqual(main.parse_lxc_ls_output(""), [])
-        self.assertEqual(main.parse_lxc_ls_output("NAME STATE PID IPV4 IPV6"), [])
-
-    async def test_invalid_name_and_duplicate(self):
-        response = await self.client.post("/containers", json={"name": "../bad", "distro": "alpine"}, headers=self.csrf_headers())
-        self.assertEqual(response.status_code, 422)
-        with patch.object(main, "get_container_info", AsyncMock(return_value=main.ContainerResponse(name="demo", status="STOPPED"))):
-            self.assertEqual((await self.client.post("/containers", json={"name": "demo", "distro": "alpine"}, headers=self.csrf_headers())).status_code, 409)
-
-    async def test_metrics_cpu_delta_and_disk_totals(self):
-        values = [(0, "usage_usec 1000000", ""), (0, "usage_usec 1250000", ""), (0, "1024", ""), (0, "max", ""), (0, "8:0 rbytes=10 wbytes=20 rios=1\n8:1 rbytes=30 wbytes=40", ""), (0, "header\nheader\neth0: 100 0 0 0 0 0 0 0 200 0 0 0 0 0 0 0", "")]
-        with patch.object(main, "run_lxc_attach", AsyncMock(side_effect=values)), patch.object(main, "get_snapshot_list", AsyncMock(return_value=["snap0"])), patch.object(main.time, "monotonic", side_effect=[10.0, 10.5]), patch.object(main.asyncio, "sleep", AsyncMock()):
-            metrics = await main.get_container_metrics("demo")
-        self.assertEqual(metrics.cpu_usage_percent, 50.0)
-        self.assertEqual(metrics.disk_read_bytes, 40)
-        self.assertEqual(metrics.disk_write_bytes, 60)
-        self.assertEqual(metrics.network_tx_bytes, 200)
-        self.assertIsNone(metrics.memory_limit_bytes)
-
-    async def test_dashboard_metrics_skip_snapshot_subprocess(self):
-        with patch.object(main, "get_container_info", AsyncMock(return_value=main.ContainerResponse(name="demo", status="RUNNING"))), patch.object(main, "run_lxc_attach", AsyncMock(return_value=(1, "", "unavailable"))), patch.object(main, "get_snapshot_list", AsyncMock(return_value=[])) as snapshots:
-            response = await self.client.get("/containers/demo/metrics?include_snapshots=false")
-            self.assertEqual(response.status_code, 200)
-            snapshots.assert_not_awaited()
-            response = await self.client.get("/containers/demo/metrics")
-            self.assertEqual(response.status_code, 200)
-            snapshots.assert_awaited_once_with("demo")
-
-    async def test_stopped_metrics_and_snapshot_listing(self):
-        with patch.object(main, "get_container_info", AsyncMock(return_value=main.ContainerResponse(name="demo", status="STOPPED"))), patch.object(main, "run_lxc_cmd", AsyncMock(return_value=(0, "snap0 (/path) 2026:10:12 12:00:00", ""))):
-            self.assertEqual((await self.client.get("/containers/demo/metrics")).status_code, 400)
-            self.assertEqual((await self.client.get("/containers/demo/snapshots")).json(), {"snapshots": ["snap0"]})
-
-    async def test_restart_stops_then_starts(self):
-        with patch.object(main, "get_container_info", AsyncMock(return_value=main.ContainerResponse(name="demo", status="RUNNING"))), patch.object(main, "run_lxc_cmd", AsyncMock(return_value=(0, "", ""))) as command, patch.object(main.asyncio, "sleep", AsyncMock()):
-            self.assertEqual((await self.client.post("/containers/demo/restart", headers=self.csrf_headers())).status_code, 200)
-            self.assertEqual([call.args[0] for call in command.await_args_list], ["stop", "start"])
-
-    async def test_missing_container_and_command_error(self):
-        with patch.object(main, "get_container_info", AsyncMock(return_value=None)):
-            self.assertEqual((await self.client.get("/containers/missing/snapshots")).status_code, 404)
-        with patch.object(main, "run_lxc_cmd", AsyncMock(return_value=(1, "", "LXC unavailable"))):
-            self.assertEqual((await self.client.get("/containers")).status_code, 500)
-            self.assertFalse((await self.client.get("/health")).json()["lxc_accessible"])
 
 class ShellBridgeTests(unittest.TestCase):
     """End-to-end shell session through the WebSocket pipe bridge.
@@ -337,9 +565,6 @@ class ShellBridgeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as bindir:
             shim = Path(bindir) / "lxc-attach"
-            # Binary-mode readline splits ONLY on \n: a \r-terminated line
-            # never completes, so this shim catches missing CR translation
-            # the way the container's dash does (bash forgives \r).
             shim.write_text(
                 "#!/usr/bin/env python3\n"
                 "import sys\n"
